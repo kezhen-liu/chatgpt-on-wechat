@@ -12,11 +12,14 @@ from bot.session_manager import SessionManager
 from bridge.context import ContextType, Context
 from bridge.reply import Reply, ReplyType
 from common.log import logger
+from common.token_bucket import TokenBucket
 from config import conf
 from bot.chatgpt.chat_gpt_session import ChatGPTSession
 from bot.baidu.baidu_wenxin_session import BaiduWenxinSession
 from google.generativeai.types import HarmCategory, HarmBlockThreshold
 
+class GeminiBotRateLimitError(Exception):
+    pass
 
 # OpenAI对话模型API (可用)
 class GoogleGeminiBot(Bot):
@@ -29,11 +32,18 @@ class GoogleGeminiBot(Bot):
         self.model = conf().get("model") or "gemini-pro"
         if self.model == "gemini":
             self.model = "gemini-pro"
+        if conf().get("rate_limit_chatgpt"):
+            self.tb4gemini = TokenBucket(conf().get("rate_limit_chatgpt", 15), timeout = 5.0)
+        self.grounding_prefix = None
+        if conf().get("gemini_grounding_prefix"):
+            self.grounding_prefix = conf().get("gemini_grounding_prefix", "!search")
     def reply(self, query, context: Context = None) -> Reply:
         try:
             if context.type != ContextType.TEXT:
                 logger.warn(f"[Gemini] Unsupported message type, type={context.type}")
                 return Reply(ReplyType.TEXT, None)
+            if conf().get("rate_limit_chatgpt") and not self.tb4gemini.get_token():
+                raise GeminiBotRateLimitError("RateLimitError: rate limit exceeded")
             logger.info(f"[Gemini] query={query}")
             session_id = context["session_id"]
             session = self.sessions.session_query(query, session_id)
@@ -49,11 +59,18 @@ class GoogleGeminiBot(Bot):
                 HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
                 HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
             }
-            
+
+            use_grounding = False
+            if self.grounding_prefix is not None and gemini_messages[-1] and gemini_messages[-1]["parts"][0]["text"].startswith(self.grounding_prefix):
+                gemini_messages[-1]["parts"][0]["text"] = gemini_messages[-1]["parts"][0]["text"].replace(self.grounding_prefix, "", 1).strip()
+                use_grounding = True
+                logger.info("[Gemini] grounding enabled")
+
             # 生成回复，包含安全设置
             response = model.generate_content(
                 gemini_messages,
-                safety_settings=safety_settings
+                safety_settings=safety_settings,
+                tools = 'google_search_retrieval' if use_grounding else None
             )
             if response.candidates and response.candidates[0].content:
                 reply_text = response.candidates[0].content.parts[0].text
@@ -71,6 +88,9 @@ class GoogleGeminiBot(Bot):
                 return Reply(ReplyType.ERROR, error_message)
                     
         except Exception as e:
+            if isinstance(e, GeminiBotRateLimitError):
+                logger.error(f"[Gemini] Error generating response: {str(e)}", exc_info=True)
+                return Reply(ReplyType.TEXT, "提问太快啦，请休息一下再问我吧")
             logger.error(f"[Gemini] Error generating response: {str(e)}", exc_info=True)
             error_message = "Failed to invoke [Gemini] api!"
             self.sessions.session_reply(error_message, session_id)
